@@ -16,6 +16,7 @@ COPY app.py ./
 # (Optional) Copy prompts if folder exists
 # COPY prompts ./prompts
 
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH="/app:/app/my_ai_assistant:${PYTHONPATH}"
 
 CMD ["uvicorn", "app:app", "--reload", "--host", "0.0.0.0", "--port", "8000"]

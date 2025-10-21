@@ -12,7 +12,11 @@ class StubOrchestrator:
         """Return empty services dict."""
         return {}
     
-    async def interpret(self, message: str, services: Dict[str, str] | None = None) -> Dict[str, Any]:
+    def reset(self) -> None:
+        """Reset any internal state (no-op for stub)."""
+        return None
+    
+    async def interpret(self, message: str, services: Dict[str, str] | None = None, *, messages: list[dict] | None = None) -> Dict[str, Any]:
         """Return a stub response."""
         return {
             "intents": [],

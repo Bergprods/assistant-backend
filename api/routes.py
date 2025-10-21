@@ -3,67 +3,86 @@ from __future__ import annotations
 import os
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, List
+import importlib
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
-from api.dependencies import get_chat_manager
+from api.dependencies import get_chat_manager, get_db_session
+from managers.chat_log_manager import ChatLogManager
+from repositorys import RouterMessage as RouterMessageModel, Session as SessionModel, ErrorLog as ErrorLogModel
+
+chatlog_manager = ChatLogManager()
 logger = logging.getLogger(__name__)
 
+class BackendChatRequest(BaseModel):
+    message: str
+    sessionId: Optional[str] = None
+    waitFor: Optional[float] = None
+    historyLimit: Optional[int] = None
+
+    class Config:
+        allow_population_by_field_name = True
+
+    @property
+    def session_id(self) -> str:
+        return self.sessionId or "default"
+
+    @property
+    def wait_for(self) -> Optional[float]:
+        return self.waitFor
+
+    @property
+    def history_limit(self) -> Optional[int]:
+        return self.historyLimit
+
+
+class Intent(BaseModel):
+    domain: str
+    requires: list[str] = Field(default_factory=list)
+
+
+class OrchestrateMetadata(BaseModel):
+    timestamp: str
+    originalMessage: str
+
+    class Config:
+        extra = "allow"
+
+
+class OrchestrateResponse(BaseModel):
+    intents: List[Intent]
+    direct_response: str = Field(alias="directResponse")
+    metadata: OrchestrateMetadata
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class BackendChatResponse(BaseModel):
+    orchestrator: OrchestrateResponse
+    memory: list[dict[str, Any]] = Field(default_factory=list)
+
+
+# Try to override stubs with real classes if available at runtime
+_mod = None
 try:
-    from my_ai_assistant.api.backend_api import (
-        BackendChatRequest,
-        BackendChatResponse,
-        Intent,
-        OrchestrateMetadata,
-        OrchestrateResponse,
-    )
+    _mod = importlib.import_module("my_ai_assistant.api.backend_api")
 except ModuleNotFoundError:
     logger.warning("my_ai_assistant.api.backend_api missing; using local schema stubs")
-
-    class BackendChatRequest(BaseModel):
-        message: str
-        sessionId: Optional[str] = None
-        waitFor: Optional[float] = None
-        historyLimit: Optional[int] = None
-
-        class Config:
-            allow_population_by_field_name = True
-
-        @property
-        def session_id(self) -> str:
-            return self.sessionId or "default"
-
-        @property
-        def wait_for(self) -> Optional[float]:
-            return self.waitFor
-
-        @property
-        def history_limit(self) -> Optional[int]:
-            return self.historyLimit
-
-    class Intent(BaseModel):
-        domain: str
-        requires: list[str] = Field(default_factory=list)
-
-    class OrchestrateMetadata(BaseModel):
-        timestamp: str
-        originalMessage: str
-
-        class Config:
-            extra = "allow"
-
-    class OrchestrateResponse(BaseModel):
-        intents: list[Intent]
-        directResponse: str
-        metadata: OrchestrateMetadata
-
-    class BackendChatResponse(BaseModel):
-        orchestrator: OrchestrateResponse
-        memory: list[dict[str, Any]] = Field(default_factory=list)
+if _mod:
+    BackendChatRequest = getattr(_mod, "BackendChatRequest", BackendChatRequest)
+    BackendChatResponse = getattr(_mod, "BackendChatResponse", BackendChatResponse)
+    Intent = getattr(_mod, "Intent", Intent)
+    OrchestrateMetadata = getattr(_mod, "OrchestrateMetadata", OrchestrateMetadata)
+    OrchestrateResponse = getattr(_mod, "OrchestrateResponse", OrchestrateResponse)
 
 router = APIRouter(prefix="/api/orchestrator")
+def _resolve_chat_manager():
+    # Resolve on each request so tests can monkeypatch api.dependencies.get_chat_manager
+    from api.dependencies import get_chat_manager as _gm
+    return _gm()
+
 
 
 def _fallback_response(message: str) -> OrchestrateResponse:
@@ -83,11 +102,11 @@ def _fallback_response(message: str) -> OrchestrateResponse:
         timestamp=datetime.now(timezone.utc).isoformat(),
         originalMessage=message,
     )
-    return OrchestrateResponse(intents=intents, directResponse=direct, metadata=metadata)
+    return OrchestrateResponse(intents=intents, direct_response=direct, metadata=metadata)
 
 
 @router.post("/chat", response_model=BackendChatResponse)
-async def chat(req: BackendChatRequest, manager = Depends(get_chat_manager)) -> BackendChatResponse:
+async def chat(req: BackendChatRequest, manager = Depends(_resolve_chat_manager)) -> BackendChatResponse:
     if not req.message:
         raise HTTPException(400, "message required")
 
@@ -132,7 +151,7 @@ async def assistant_status():
 async def get_history(
     sessionId: Optional[str] = Query(default="default"),
     limit: Optional[int] = Query(default=12),
-    manager = Depends(get_chat_manager),
+    manager = Depends(_resolve_chat_manager),
 ):
     """Return recent chat history for the given session without sending a new message."""
     if manager is None:
@@ -140,3 +159,93 @@ async def get_history(
     session_id = sessionId or "default"
     history = await manager.get_history(session_id=session_id, limit=limit)
     return history
+
+
+@router.post("/log")
+async def ingest_full_message(payload: dict, db = Depends(get_db_session)):
+    """Ingest a full router message JSON and persist across tables, returns ids."""
+    res = await chatlog_manager.create_full_message(db, payload)
+    return res
+
+
+@router.get("/log/{sessionId}")
+async def get_full_message(sessionId: str, includeOriginal: bool = Query(default=False), db = Depends(get_db_session)):
+    """Return the latest full message for a session (sanitized)."""
+    res = await chatlog_manager.get_full_message(db, sessionId, include_original=includeOriginal)
+    if not res:
+        raise HTTPException(404, "No message for session")
+    return res
+
+
+@router.get("/router_messages/{sessionId}")
+async def list_router_messages(
+    sessionId: str,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    since: Optional[str] = Query(default=None, description="ISO timestamp to filter createdAt > since"),
+    db = Depends(get_db_session),
+):
+    from sqlalchemy import select, desc
+    from datetime import datetime
+    # Resolve session row
+    res = await db.execute(select(SessionModel).where(SessionModel.session_id == sessionId))
+    session_row = res.scalars().first()
+    if not session_row:
+        return []
+    q = select(RouterMessageModel).where(RouterMessageModel.session_id_fk == session_row.id)
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            from sqlalchemy import and_
+            q = q.where(RouterMessageModel.created_at > since_dt)
+        except Exception:
+            pass
+    q = q.order_by(desc(RouterMessageModel.created_at)).offset(offset).limit(limit)
+    rows = (await db.execute(q)).scalars().all()
+    return [
+        {
+            "id": r.id,
+            "sessionId": sessionId,
+            "sourceMessageId": r.source_message_id,
+            "schemaVersion": r.schema_version,
+            "language": r.language,
+            "createdAt": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/errors/{sessionId}")
+async def list_errors(
+    sessionId: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    details: bool = Query(default=False, description="Include error payload details"),
+    db = Depends(get_db_session),
+):
+    from sqlalchemy import select, desc
+    res = await db.execute(select(SessionModel).where(SessionModel.session_id == sessionId))
+    session_row = res.scalars().first()
+    if not session_row:
+        return []
+
+    q = (
+        select(ErrorLogModel)
+        .where(ErrorLogModel.session_id_fk == session_row.id)
+        .order_by(desc(ErrorLogModel.created_at))
+        .offset(offset)
+        .limit(limit)
+    )
+    rows = (await db.execute(q)).scalars().all()
+    # Sanitize payload by omitting it or only providing a small snippet
+    out = []
+    for e in rows:
+        item = {
+            "id": e.id,
+            "message": e.message,
+            "createdAt": e.created_at.isoformat() if e.created_at else None,
+        }
+        if details:
+            item["payload"] = e.payload
+        out.append(item)
+    return out

@@ -54,9 +54,15 @@ class ChatManager:
         result = await self.orchestrator.interpret(message, self.orchestrator.list_services(), messages=messages)
 
         # store assistant reply
+        assistant_text = (
+            result.get("direct_response")
+            or result.get("directResponse")
+            or result.get("directMessage")
+            or ""
+        )
         await self.memory.append_assistant(
             session_id,
-            result.get("directResponse", ""),
+            assistant_text,
             intents=result.get("intents"),
         )
 

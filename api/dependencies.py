@@ -6,8 +6,11 @@ import importlib
 from typing import Optional
 
 from repositorys.redis_work_memory import RedisWorkMemory
+from repositorys import get_async_engine, get_session_maker
+from contextlib import asynccontextmanager
 from services.work_memory_service import WorkMemoryService
-from managers.chat_manager import ChatManager, OrchestratorLike
+from managers.chat_manager import ChatManager
+from my_ai_assistant.managers import OrchestratorLike
 
 
 logger = logging.getLogger(__name__)
@@ -110,3 +113,37 @@ def get_chat_manager() -> ChatManager | None:
     # If orchestrator unavailable, return None
     logger.info("ChatManager unavailable; orchestrator components not loaded")
     return None
+
+
+_engine = None
+_SessionLocal = None
+
+def _normalize_db_url(url: str | None) -> str | None:
+    if not url:
+        return url
+    # ensure async driver for postgres
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif url.startswith("postgresql://") and "+" not in url.split("://", 1)[1]:
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return url
+
+def _ensure_db():
+    global _engine, _SessionLocal
+    if _SessionLocal is not None:
+        return
+    import os
+    url = _normalize_db_url(os.getenv("DATABASE_URL"))
+    _engine = get_async_engine(url)
+    _SessionLocal = get_session_maker(_engine)
+
+async def get_db_session():
+    if _SessionLocal is None:
+        _ensure_db()
+    async with _SessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except:  # noqa: E722
+            await session.rollback()
+            raise
